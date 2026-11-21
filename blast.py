@@ -1444,6 +1444,13 @@ def import_check(patched, test_patches=None):
             pass
 
 
+def keep_gone(ctx, path, got):
+    """tests of a deleted or renamed-away test file no longer exist, so they fail: never drop them
+    after running the pinned copies here"""
+    ctx.setdefault("keep_ids", set()).update(MAP_TESTS[i] for i in got)
+    ctx["keep_ids"].update(MAP_TESTS[i] for i in BY_FILE.get(path, ()))
+
+
 def select_commit(patch_text, why, ctx=None):
     if ctx is None:
         ctx = {}
@@ -1461,7 +1468,10 @@ def select_commit(patch_text, why, ctx=None):
             continue
         if f["status"] == "renamed" and path != newpath:
             # renaming a module or fixture = deleting the old one
-            out |= deleted_file_tests(path, why)
+            got = deleted_file_tests(path, why)
+            out |= got
+            if path.startswith("tests/"):
+                keep_gone(ctx, path, got)
             continue
         if path.startswith("tests/fixtures/"):
             kinds.add("fixture")
@@ -1488,7 +1498,10 @@ def select_commit(patch_text, why, ctx=None):
             continue
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
             if f["status"] == "deleted":
-                out |= deleted_file_tests(path, why)
+                got = deleted_file_tests(path, why)
+                out |= got
+                if path.startswith("tests/"):
+                    keep_gone(ctx, path, got)
                 continue
             if f["status"] == "added":
                 old_text = ""
@@ -1854,8 +1867,9 @@ def refine(nums, secs, ids, ctx, why):
         return nums
     if time.time() - START > 120:
         return nums
-    runn = [n for n in nums if runnable(ids[n])]
-    fixed = [n for n in nums if not runnable(ids[n])]
+    keep_ids = ctx.get("keep_ids", set())
+    runn = [n for n in nums if runnable(ids[n]) and ids[n] not in keep_ids]
+    fixed = [n for n in nums if not runnable(ids[n]) or ids[n] in keep_ids]
     big = [n for n in runn if secs[n] >= BIG_T]
     exp = [n for n in runn if secs[n] >= EXP_T]
     mid = [n for n in exp if secs[n] < BIG_T]
