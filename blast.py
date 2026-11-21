@@ -1690,6 +1690,15 @@ def select_commit(patch_text, why, ctx=None):
             why.append(f"{path}: fixture -> {len(ts)}")
             out |= ts
             continue
+        base = os.path.basename(path)
+        if path.startswith("tests/") and (base == "conftest.py" or (base == "__init__.py" and f["status"] != "modified")):
+            # pytest configuration, or a package marker appearing or vanishing: every test below it
+            d = os.path.dirname(path) + "/"
+            got = {i for f2, ts in BY_FILE.items() if f2.startswith(d) for i in ts}
+            why.append(f"{path}: {base} {f['status']} -> {len(got)}")
+            out |= got
+            ctx["unknown_files"] = True
+            continue
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
             if f["status"] == "deleted":
                 got = deleted_file_tests(path, why)
