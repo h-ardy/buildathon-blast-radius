@@ -405,14 +405,16 @@ def functions_by_name(tree):
     out = {}
 
     def walk(node, prefix):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                q = prefix + (child.name,)
-                if not isinstance(child, ast.ClassDef):
-                    out.setdefault(q, child)
-                walk(child, q)
-            else:
-                walk(child, prefix)
+        # defs can only sit in statement lists, so only those are searched
+        for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+            for child in getattr(node, field, None) or ():
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    q = prefix + (child.name,)
+                    if not isinstance(child, ast.ClassDef):
+                        out.setdefault(q, child)
+                    walk(child, q)
+                elif isinstance(child, (ast.stmt, ast.excepthandler, ast.match_case)):
+                    walk(child, prefix)
 
     walk(tree, ())
     return out
@@ -676,13 +678,23 @@ def assigned_names(st):
     return names
 
 
+_REFS = {}
+
+
 def referenced(node):
+    """names and attribute names used anywhere in node (cached: the trees are parsed once and kept)"""
+    k = id(node)
+    hit = _REFS.get(k)
+    if hit is not None and hit[0] is node:
+        return hit[1]
     out = set()
     for n in ast.walk(node):
         if isinstance(n, ast.Name):
             out.add(n.id)
         elif isinstance(n, ast.Attribute):
             out.add(n.attr)
+    out = frozenset(out)
+    _REFS[k] = (node, out)
     return out
 
 
@@ -803,6 +815,31 @@ KEYSET_CHANGED = [True]
 ALEN = M.get("alen", {})
 
 
+_AREF = {}
+
+
+def attr_ref_index(path):
+    """(names referenced, lines) for every statement inside a function of path, built once"""
+    idx = _AREF.get(path)
+    if idx is not None:
+        return idx
+    idx = []
+    for node in ast.walk(tree_of(path)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for st in ast.walk(node):
+                if isinstance(st, (ast.stmt, ast.Lambda)) and st is not node and not hasattr(st, "body") or isinstance(st, ast.Lambda):
+                    idx.append((referenced(st), range(st.lineno, st.end_lineno + 1)))
+                elif isinstance(st, ast.stmt) and st is not node:
+                    hdr = [getattr(st, f) for f in ("test", "iter", "items", "value") if getattr(st, f, None) is not None]
+                    refs = set()
+                    for h in hdr:
+                        if not isinstance(h, list):
+                            refs |= referenced(h)
+                    idx.append((frozenset(refs), range(st.lineno, header_end(st) + 1)))
+    _AREF[path] = idx
+    return idx
+
+
 def attr_ref_users(names):
     """line coverage of every statement inside a sqlglot function that mentions one of `names`
     as an attribute (self.NAME, cls.NAME) or a bare name"""
@@ -810,16 +847,9 @@ def attr_ref_users(names):
     for path, text in SRC.items():
         if not path.startswith("sqlglot/") or not any(n in text for n in names):
             continue
-        for node in ast.walk(tree_of(path)):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                for st in ast.walk(node):
-                    if isinstance(st, (ast.stmt, ast.Lambda)) and st is not node and not hasattr(st, "body") or isinstance(st, ast.Lambda):
-                        if referenced(st) & names:
-                            out |= line_tests(path, range(st.lineno, st.end_lineno + 1))
-                    elif isinstance(st, ast.stmt) and st is not node:
-                        hdr = [getattr(st, f) for f in ("test", "iter", "items", "value") if getattr(st, f, None) is not None]
-                        if any(referenced(h) & names for h in hdr if not isinstance(h, list)):
-                            out |= line_tests(path, range(st.lineno, header_end(st) + 1))
+        for refs, lines in attr_ref_index(path):
+            if refs & names:
+                out |= line_tests(path, lines)
     return out
 
 
@@ -1121,6 +1151,17 @@ def module_level_tests(path, st, why):
     return out
 
 
+_IMPS = {}
+
+
+def imports_of(path):
+    """the import statements of path, in ast.walk order (cached)"""
+    got = _IMPS.get(path)
+    if got is None:
+        got = _IMPS[path] = [st for st in ast.walk(tree_of(path)) if isinstance(st, (ast.Import, ast.ImportFrom))]
+    return got
+
+
 def name_users(path, names, why, depth):
     """Tests reached by module-level names of `path`: functions and classes that use them, in this
     module and in modules importing them by name."""
@@ -1148,9 +1189,8 @@ def name_users(path, names, why, depth):
         out |= test_code_users(modname, names)
     # other modules importing these names
     for q in IMPORTERS.get(path, ()):
-        qtree = tree_of(q)
         imported = set()
-        for st in ast.walk(qtree):
+        for st in imports_of(q):
             if isinstance(st, ast.ImportFrom) and st.module and (st.module == modname or st.module.endswith("." + modname.rsplit(".", 1)[-1])):
                 for a in st.names:
                     if a.name in names or a.name == "*":
@@ -1164,41 +1204,67 @@ def name_users(path, names, why, depth):
     return out
 
 
+_TCU = {}
+
+
+def test_code_index(f):
+    """for a test file: its import statements, and per simple statement the bare names and attribute
+    names it uses with its lines"""
+    idx = _TCU.get(f)
+    if idx is not None:
+        return idx
+    tree = tree_of(f)
+    imports, stmts = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.append(node)
+        if isinstance(node, ast.stmt) and not hasattr(node, "body"):
+            ids, attrs = set(), set()
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name):
+                    ids.add(n.id)
+                elif isinstance(n, ast.Attribute):
+                    attrs.add(n.attr)
+            stmts.append((frozenset(ids), frozenset(attrs), range(node.lineno, node.end_lineno + 1)))
+    idx = _TCU[f] = (imports, stmts)
+    return idx
+
+
 def test_code_users(modname, names):
     """tests whose own code reads mod.NAME or imports NAME from the module"""
     out = set()
     short = modname.rsplit(".", 1)[-1]
     for f, ts in BY_FILE.items():
-        tree = tree_of(f)
+        imports, stmts = test_code_index(f)
         local = set()
         mod_alias = False
-        for node in ast.walk(tree):
+        for node in imports:
             if isinstance(node, ast.ImportFrom) and node.module == modname:
                 for a in node.names:
                     if a.name in names or a.name == "*":
                         local.add(a.asname or a.name)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                if any((a.asname or a.name).split(".")[-1] == short for a in node.names):
-                    mod_alias = True
+            elif any((a.asname or a.name).split(".")[-1] == short for a in node.names):
+                mod_alias = True
         look = local | (names if mod_alias else set())
         if not look:
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.stmt) and not hasattr(node, "body"):
-                refs = set()
-                for n in ast.walk(node):
-                    if isinstance(n, ast.Name) and n.id in local:
-                        refs.add(n.id)
-                    elif isinstance(n, ast.Attribute) and n.attr in names and mod_alias:
-                        refs.add(n.attr)
-                if refs:
-                    got = line_tests(f, range(node.lineno, node.end_lineno + 1))
-                    out |= got if got else ts
+        for ids, attrs, lines in stmts:
+            if (ids & local) or (mod_alias and (attrs & names)):
+                got = line_tests(f, lines)
+                out |= got if got else ts
     return out
 
 
-def stmt_users_in_function(path, fn, names):
-    out = set()
+_SUF = {}
+
+
+def stmt_users_index(fn):
+    """per statement inside fn: (names used in it, or in its header for compound statements, lines);
+    and the names used by fn's decorators and defaults (cached)"""
+    hit = _SUF.get(id(fn))
+    if hit is not None and hit[0] is fn:
+        return hit[1], hit[2]
+    idx = []
     for node in ast.walk(fn):
         if isinstance(node, ast.stmt) and node is not fn:
             own = node
@@ -1212,13 +1278,22 @@ def stmt_users_in_function(path, fn, names):
                         refs |= referenced(x)
                 else:
                     refs |= referenced(h)
-            if refs & names:
-                out |= line_tests(path, range(own.lineno, hdr_end + 1))
-    # defaults / decorators evaluated at import
-    hdr = []
+            idx.append((frozenset(refs), range(own.lineno, hdr_end + 1)))
+    hdr = set()
     for d in fn.decorator_list + fn.args.defaults + [x for x in fn.args.kw_defaults if x is not None]:
-        hdr.append(d)
-    if any(referenced(h) & names for h in hdr):
+        hdr |= referenced(d)
+    _SUF[id(fn)] = (fn, idx, frozenset(hdr))
+    return idx, frozenset(hdr)
+
+
+def stmt_users_in_function(path, fn, names):
+    out = set()
+    idx, hdr = stmt_users_index(fn)
+    for refs, lines in idx:
+        if refs & names:
+            out |= line_tests(path, lines)
+    # defaults / decorators evaluated at import
+    if hdr & names:
         out |= line_tests(path, func_body_lines(fn))
     return out
 
@@ -1657,6 +1732,7 @@ RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
 START = None
+HARD_T = float(os.environ.get("BR_HARD_T", "150"))  # seconds into the batch after which every commit runs all
 
 
 def runnable(tid):
@@ -1925,6 +2001,13 @@ def main():
     ids = {t["number"]: t["id"] for t in tests}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         why = []
+        if time.time() - START > HARD_T:
+            # far over the usual time: finish the batch safely instead of risking the time limit
+            nums = [t["number"] for t in tests]
+            workers = pack(nums, secs)
+            print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
+            log(f"{patch.stem}: out of time -> all")
+            continue
         try:
             ctx = {}
             sel = select_commit(patch.read_text(errors="replace"), why, ctx)
