@@ -43,6 +43,22 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
 
 sys.meta_path.insert(0, Finder())
+
+# The scorer allows 256 processes, threads included, and the host may have many cores. numpy's
+# BLAS and DuckDB each start a thread per core, so keep them to one thread.
+try:
+    import duckdb
+
+    _connect = duckdb.connect
+
+    def _one_thread_connect(database=":memory:", *args, **kwargs):
+        config = dict(kwargs.pop("config", None) or {})
+        config.setdefault("threads", 1)
+        return _connect(database, *args, config=config, **kwargs)
+
+    duckdb.connect = _one_thread_connect
+except Exception:  # noqa
+    pass
 sys.path.insert(0, spec["tests_root"])
 os.environ["SKIP_INTEGRATION"] = "0"
 

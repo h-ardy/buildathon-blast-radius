@@ -1318,6 +1318,11 @@ for d in list(Dialect.classes):
     Dialect.get_or_raise(d)
 """
 SG_TREE = HERE / "sg"
+# one thread per numeric library: the scorer counts threads against a 256-process limit
+THREAD_ENV = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "RAYON_NUM_THREADS",
+                               "POLARS_MAX_THREADS", "ARROW_NUM_THREADS")}
+THREAD_ENV["LANG"] = "C.UTF-8"
 
 
 def import_check(patched):
@@ -1338,8 +1343,8 @@ def import_check(patched):
         name = fh.name
     try:
         r = subprocess.run([sys.executable, "-c", CHECK_SCRIPT, name], cwd="/tmp",
-                           env={"PYTHONPATH": str(SG_TREE), "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp",
-                                "PATH": os.environ.get("PATH", "")},
+                           env=dict(THREAD_ENV, PYTHONPATH=str(SG_TREE), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
+                                    PATH=os.environ.get("PATH", "")),
                            capture_output=True, text=True, timeout=60)
         ok = r.returncode == 0
         if not ok:
@@ -1591,8 +1596,8 @@ def run_here(ids, patched, test_patches, failfast, budget):
         name = fh.name
     try:
         r = subprocess.run([sys.executable, str(HERE / "runner.py"), name], cwd="/tmp",
-                           env={"PYTHONPATH": str(SG_TREE), "PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp",
-                                "PATH": os.environ.get("PATH", ""), "SKIP_INTEGRATION": "0"},
+                           env=dict(THREAD_ENV, PYTHONPATH=str(SG_TREE), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
+                                    PATH=os.environ.get("PATH", ""), SKIP_INTEGRATION="0"),
                            capture_output=True, text=True, timeout=budget)
         if r.returncode != 0:
             return None
