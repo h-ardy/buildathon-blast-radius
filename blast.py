@@ -439,6 +439,82 @@ def scope_changes(old_tree, new_tree, lines):
     return out
 
 
+def defined_names(body):
+    """names a module or class body defines"""
+    out = set()
+    for st in body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(st.name)
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            out.update(assigned_names(st))
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            out.update((a.asname or a.name).split(".")[0] for a in st.names if a.name != "*")
+    return out
+
+
+def removed_names(old_tree, new_tree):
+    """module-level names, and per class the class-level names, that the patch removes or renames away:
+    -> (module names, {class qualname: names})"""
+    mod = defined_names(old_tree.body) - defined_names(new_tree.body)
+    old_c = {q: n for q, n in classes_by_name(old_tree).items()}
+    new_c = classes_by_name(new_tree)
+    cls = {}
+    for q, node in old_c.items():
+        if q in new_c:
+            gone = defined_names(node.body) - defined_names(new_c[q].body)
+            if gone:
+                cls[q] = gone
+    return mod, cls
+
+
+def classes_by_name(tree):
+    out = {}
+
+    def walk(node, prefix):
+        for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+            for child in getattr(node, field, None) or ():
+                if isinstance(child, ast.ClassDef):
+                    q = prefix + (child.name,)
+                    out.setdefault(q, child)
+                    walk(child, q)
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    walk(child, prefix + (child.name,))
+                elif isinstance(child, (ast.stmt, ast.excepthandler, ast.match_case)):
+                    walk(child, prefix)
+
+    walk(tree, ())
+    return out
+
+
+def inherited(ckey, name):
+    """True if a base class of ckey (at the pinned commit) defines name"""
+    if name.startswith("__") and name.endswith("__"):
+        return True
+    seen, stack = set(), list(M["classes"].get(ckey, ()))
+    while stack:
+        b = stack.pop()
+        if b in seen:
+            continue
+        seen.add(b)
+        node = class_node(b)
+        if node is not None and name in defined_names(node.body):
+            return True
+        stack.extend(M["classes"].get(b, ()))
+    return False
+
+
+def mention_tests(names):
+    """tests whose own code mentions one of `names` (bare or as an attribute), at the statement level"""
+    out = set()
+    for f, ts in BY_FILE.items():
+        imports, stmts = test_code_index(f)
+        for ids, attrs, lines in stmts:
+            if (ids | attrs) & names:
+                got = line_tests(f, lines)
+                out |= got if got else ts
+    return out
+
+
 def select_python(path, old_text, hunks, why):
     new_text = apply_hunks(old_text, hunks)
     try:
@@ -458,6 +534,32 @@ def select_python(path, old_text, hunks, why):
         return set()
 
     scope_extra = set()
+    # names that no longer exist: every use of them now fails (exp.Pos, self.pos_sql, imports)
+    gone_mod, gone_cls = removed_names(old_tree, new_tree)
+    modname_here = M["modnames"].get(path)
+    gone_cls = {q: {n for n in names if not inherited(f"{modname_here}." + ".".join(q), n)}
+                for q, names in gone_cls.items()}
+    gone_cls = {q: names for q, names in gone_cls.items() if names}
+    gone = set(gone_mod)
+    for q, names in gone_cls.items():
+        gone |= names
+    if gone:
+        NEED_IMPORT_CHECK[0] = True
+        got = attr_ref_users(gone) | mention_tests(gone)
+        if gone_mod:
+            got |= name_users(path, gone_mod, why, 0)
+        for name in gone:
+            if name.endswith("_sql"):
+                ecls = M.get("exprclasses", {}).get(name[:-4])
+                if ecls:
+                    for q in gone_cls:
+                        for c in all_subs(f"{M['modnames'].get(path)}." + ".".join(q)):
+                            got |= dispatch_readers(c, {"T" + ecls})
+        modname = M["modnames"].get(path)
+        for cname in gone_mod:
+            got |= class_users(all_subs(f"{modname}.{cname}"))
+        scope_extra |= got
+        why.append(f"{path}: removed names {sorted(gone)[:8]} -> {len(got)}")
     _rem, _ins = changed_old_lines(hunks)
     for q, fo in scope_changes(old_tree, new_tree, _rem | _ins | {p - 1 for p in _ins}):
         got = line_tests(path, func_body_lines(fo))
@@ -881,7 +983,8 @@ def keyed_readers(c, a, keys, star=True):
     r = readers(c, a)
     s = AANY.get(c, {}).get(a)
     anyk = set(SETS[s]) if s is not None else set()
-    out |= r - anyk
+    if not NO_ANYK:
+        out |= r - anyk
     return out
 
 
@@ -948,6 +1051,9 @@ def attr_tests(ckey, names, why, keys=None):
                 # TRANSFORMS feeds the per-class dispatch table, looked up per expression type
                 out |= keyed_readers(c, a, keys, star=False) | dispatch_readers(c, keys)
                 continue
+            if a == "TRANSFORMS":
+                # entries unknown: whoever generated anything through this class's dispatch table
+                out |= dispatch_readers(c, AKEYS.get(c, {}).get("__dispatch__", {}).keys())
             out |= keyed_readers(c, a, keys) if mode else r
     tok_names = set().union(*affected.values()) & TOK_TO_DIALECT
     if tok_names == {"NUMERIC_ESCAPES"} and keys is not None and all(k.startswith("S") for k in keys) and NUMERIC_KEYS_SAME[0]:
@@ -1729,11 +1835,13 @@ BIG_T = float(os.environ.get("BR_BIG_T", "5.0"))   # worth betting on
 MIN_EVIDENCE = 3  # cheap tests that must pass before a big one is dropped
 PARTIAL = os.environ.get("BR_PARTIAL", "0") == "1"     # also run the cheap part of a selection with costly tests
 RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
+NO_ANYK = os.environ.get("BR_NO_ANYK", "0") == "1"   # experiment only
 SPEC_RATIO = float(os.environ.get("BR_SPEC_RATIO", "1.0"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
 START = None
 HARD_T = float(os.environ.get("BR_HARD_T", "150"))  # seconds into the batch after which every commit runs all
+REFINE_T = float(os.environ.get("BR_REFINE_T", "120"))  # seconds into the batch after which no more test runs
 
 
 def runnable(tid):
@@ -1955,7 +2063,7 @@ def refine(nums, secs, ids, ctx, why):
 
     if not nums or ctx.get("unknown_files"):
         return nums
-    if time.time() - START > 120:
+    if time.time() - START > REFINE_T:
         return nums
     keep_ids = ctx.get("keep_ids", set())
     runn = [n for n in nums if runnable(ids[n]) and ids[n] not in keep_ids]
