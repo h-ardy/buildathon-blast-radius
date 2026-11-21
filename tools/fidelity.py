@@ -10,7 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 KIT = os.environ.get("BR_KIT", os.path.join(REPO, "..", "kit"))  # unpacked starter kit
 os.environ["BR_DATA"] = os.path.join(KIT, "sample")
-sp = importlib.util.spec_from_file_location("sel", os.path.join(REPO, "select.py"))
+sp = importlib.util.spec_from_file_location("sel", os.path.join(REPO, "blast.py"))
 sel = importlib.util.module_from_spec(sp)
 sp.loader.exec_module(sel)
 tests = json.load(open(os.path.join(KIT, "sample", "tests.json")))["tests"]

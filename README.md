@@ -1,6 +1,6 @@
 # Blast Radius selector (Builders Buildathon, RWX track)
 
-For each patch against sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, `select.py` prints the
+For each patch against sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, `blast.py` prints the
 tests that can fail and splits them across workers.
 
 ## How it decides

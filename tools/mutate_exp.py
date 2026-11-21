@@ -77,7 +77,7 @@ def select(patch):
     os.makedirs(os.path.join(d, "commits"))
     open(os.path.join(d, "commits", "m.patch"), "w").write(patch)
     os.symlink(os.path.join(REPO, "..", "kit", "sample", "tests.json"), os.path.join(d, "tests.json"))
-    r = subprocess.run([PY, os.path.join(REPO, "select.py")], env=dict(os.environ, BR_DATA=d),
+    r = subprocess.run([PY, os.path.join(REPO, "blast.py")], env=dict(os.environ, BR_DATA=d),
                        capture_output=True, text=True)
     line = json.loads(r.stdout.strip().splitlines()[-1])
     return {n for w in line["workers"] for n in w}
