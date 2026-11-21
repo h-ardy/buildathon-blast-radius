@@ -1069,7 +1069,9 @@ def attr_tests(ckey, names, why, keys=None):
                 for dc in all_subs(dkey):
                     for a in DIALECT_FROM_TOK:
                         out |= readers(dc, a)
-    if total_readers == 0:
+    if total_readers == 0 and DATA_RULE and DATA_VALUE[0] and not any("Enum" in b for b in M["classes"].get(ckey, ())):
+        why.append(f"{ckey}.{sorted(names)}: data value never read by any test -> {len(out)}")
+    elif total_readers == 0:
         # not read through the class while tests run (callables are not tracked): the statements
         # that use the name, or else whoever uses the class at all
         refs = attr_ref_users(set(names))
@@ -1085,6 +1087,18 @@ def attr_tests(ckey, names, why, keys=None):
 
 
 NUMERIC_KEYS_SAME = [False]
+DATA_VALUE = [False]   # the changed class attribute holds plain data (tracked per read), not a callable
+DATA_RULE = os.environ.get("BR_DATA_RULE", "1") == "1"
+
+
+def is_data_value(node):
+    """a literal value, or a container display: such class attributes were wrapped and every read
+    recorded while the map was built (callables, classes and enum members were not)"""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant):
+        return True
+    return isinstance(node, (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.DictComp, ast.SetComp, ast.ListComp))
 
 
 def assigned_dependents_keyed(c, names):
@@ -1226,6 +1240,8 @@ def import_level_tests(path, items, why, new_tree=None):
                 KEYSET_CHANGED[0] = True
                 if len(names) == 1 and new_tree is not None and isinstance(st, (ast.Assign, ast.AnnAssign)):
                     nst = new_class_stmt(new_tree, [c.name for c in classes], names[0])
+                    DATA_VALUE[0] = (nst is not None and getattr(st, "value", None) is not None
+                                     and is_data_value(st.value) and is_data_value(nst.value))
                     if nst is not None:
                         keys = changed_keys(st.value, nst.value)
                         if names[0] == "NUMERIC_ESCAPES" and keys is not None:
@@ -1236,12 +1252,17 @@ def import_level_tests(path, items, why, new_tree=None):
                             why.append(f"{ckey}.{names[0]}: no entry changed")
                             continue
                 out |= attr_tests(ckey, names, why, keys)
+                DATA_VALUE[0] = False
             elif isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant):
                 continue  # docstring
             else:
                 subs = all_subs(ckey)
                 out |= class_users(subs) | dialect_users_of_classes(subs)
                 why.append(f"{ckey}: class-level statement -> {len(out)}")
+            continue
+        if (DATA_RULE and isinstance(st, ast.Expr) and isinstance(getattr(st, "value", None), ast.Constant)
+                and isinstance(st.value.value, str) and st.lineno == tree_of(path).body[0].lineno):
+            why.append(f"{path}: module docstring -> nothing")  # nothing in sqlglot or its tests reads it
             continue
         out |= module_level_tests(path, st, why)
     if path.startswith("sqlglot/typing/") and T_TYPING_META is not None:
@@ -1858,11 +1879,11 @@ def pack(nums, secs):
 SPEC_E = os.environ.get("BR_SPEC_E", "1") == "1"      # drop expensive tests when every cheap one passes
 RUN_SMALL = os.environ.get("BR_RUN_SMALL", "1") == "1"  # run small selections, keep only failures
 EXP_T = 2.0       # "expensive": not worth running here
-BIG_T = float(os.environ.get("BR_BIG_T", "2.0"))   # worth betting on once cheap tests pass
+BIG_T = float(os.environ.get("BR_BIG_T", "5.0"))   # worth betting on
 MIN_EVIDENCE = 3  # cheap tests that must pass before a big one is dropped
 PARTIAL = os.environ.get("BR_PARTIAL", "0") == "1"     # also run the cheap part of a selection with costly tests
 RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
-NO_ANYK = os.environ.get("BR_NO_ANYK", "1") == "1"   # a test that reads a table but never looks up an entry is not affected by entry changes
+NO_ANYK = os.environ.get("BR_NO_ANYK", "0") == "1"   # experiment only
 SPEC_RATIO = float(os.environ.get("BR_SPEC_RATIO", "1.0"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
@@ -2123,6 +2144,201 @@ def refine(nums, secs, ids, ctx, why):
     return nums
 
 
+# ----------------------------------------------------------------------------- tpcds equivalence
+# test_execute_tpcds (about 21 s, the costliest test that changes often) feeds each of 57 queries
+# through parse -> optimize -> plan, runs the plan on sqlglot's python executor and compares with
+# duckdb running the query transpiled by sqlglot. If a patch only changes functions that never run in
+# the rest of the test (stage B: table setup, pickling, the executor, result checks, module import;
+# map/stageb_tpcds.json.gz holds those lines on the pinned tree), and the parsed queries, plans and
+# duckdb SQL come out identical, the test sees exactly its pinned inputs and passes as it does there.
+EQ = os.environ.get("BR_EQ", "1") == "1"
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+_STAGEB = {}
+_EQ_BASE = []
+
+
+def eq_functions(tree):
+    """-> {(qualname, n): node}; n counts repeated qualnames in source order"""
+    out = {}
+    seen = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                q = prefix + child.name
+                k = seen.get(q, 0)
+                seen[q] = k + 1
+                out[(q, k)] = child
+                walk(child, q + ".<locals>.")
+            elif isinstance(child, ast.ClassDef):
+                walk(child, prefix + child.name + ".")
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+    return out
+
+
+def eq_span(fn):
+    first = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
+    return first, fn.end_lineno
+
+
+def eq_innermost(funcs, line):
+    best = None
+    for key, fn in funcs.items():
+        a, b = eq_span(fn)
+        if a <= line <= b and (best is None or a >= eq_span(funcs[best])[0]):
+            best = key
+    return best
+
+
+def eq_body_lines(fn):
+    ls = set()
+    for st in fn.body:
+        ls.update(range(st.lineno, st.end_lineno + 1))
+    return ls
+
+
+def changed_functions(old_text, new_text, hunks):
+    """-> set of (qualname, n) of old functions holding every change, or None if a change sits
+    outside any function, or functions were added, removed or renamed"""
+    try:
+        old_t, new_t = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    fo, fn = eq_functions(old_t), eq_functions(new_t)
+    if set(fo) != set(fn):
+        return None
+    out = set()
+    delta = 0
+    for ostart, body in hunks:
+        o = ostart
+        n = ostart + delta
+        for tag, _ in body:
+            if tag == " ":
+                o += 1
+                n += 1
+            elif tag == "-":
+                k = eq_innermost(fo, o)
+                if k is None:
+                    return None
+                out.add(k)
+                o += 1
+            else:
+                k = eq_innermost(fn, n)
+                if k is None:
+                    return None
+                out.add(k)
+                n += 1
+        delta += sum(1 for t, _ in body if t == "+") - sum(1 for t, _ in body if t == "-")
+    # the same function must hold the change on both sides: a changed def line sits in its own span
+    return out, fo
+
+
+def stageb():
+    if not _STAGEB:
+        try:
+            _STAGEB.update({f: set(v) for f, v in json.load(gzip.open(HERE / "map" / "stageb_tpcds.json.gz", "rt")).items()})
+        except Exception as e:  # noqa
+            log(f"no stage B map {e!r}")
+            _STAGEB["?"] = None
+    return None if "?" in _STAGEB else _STAGEB
+
+
+def eq_eligible(patch_text):
+    """-> None, or a reason the check cannot apply"""
+    B = stageb()
+    if B is None:
+        return "no map"
+    files = parse_patch(patch_text)
+    if not files:
+        return "empty"
+    for f in files:
+        p = f["old"]
+        if (f["status"] != "modified" or f["binary"] or p != f["new"] or not p
+                or not (p.startswith("sqlglot/") and p.endswith(".py"))):
+            return f"{p}: not a sqlglot module edit"
+        old = SRC.get(p)
+        if old is None:
+            return f"{p}: unknown"
+        try:
+            new = apply_hunks(old, f["hunks"])
+        except ValueError:
+            return f"{p}: does not apply"
+        r = changed_functions(old, new, f["hunks"])
+        if r is None:
+            return f"{p}: change outside a function"
+        keys, fo = r
+        for k in keys:
+            if eq_body_lines(fo[k]) & B.get(p, set()):
+                return f"{p}: {k[0]} runs in the executor part"
+    return None
+
+
+EQ_MAX_DIFF = int(os.environ.get("BR_EQ_MAX_DIFF", "4"))
+
+
+def eq_fingerprints(patched, base, budget):
+    """baseline (base None): -> list of digests. patched: -> "same", "pass" or "differ". None if failed"""
+
+    def job():
+        import runner
+        runner.prepare({"patched": patched, "tests_root": str(SG_TREE)})
+        sys.path.insert(0, str(HERE))
+        import tpcfp
+        if base is None:
+            return json.dumps(tpcfp.fingerprints(str(SG_TREE), "tpcds")).encode()
+        return json.dumps(tpcfp.check(str(SG_TREE), base, EQ_MAX_DIFF)).encode()
+
+    out = fork_call(job, budget)
+    return None if out is None else json.loads(out.decode())
+
+
+def eq_check(ctx, patch_text, why):
+    """True if test_execute_tpcds provably sees its pinned inputs"""
+    try:
+        return _eq_check(ctx, patch_text, why)
+    except Exception as e:  # noqa  never let the check cost more than keeping the test
+        why.append(f"tpcds check error {e!r}")
+        return False
+
+
+def _eq_check(ctx, patch_text, why):
+    import time
+
+    if not EQ or not (FORK and FORK_OK[0]) or ctx.get("tests") or time.time() - START > REFINE_T:
+        return False
+    reason = eq_eligible(patch_text)
+    if reason:
+        why.append(f"tpcds check n/a: {reason}")
+        return False
+    payload = {}
+    for path, text in ctx["patched"].items():
+        mod = path[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        payload[mod] = [str(SG_TREE / path), text]
+    if not _EQ_BASE:
+        # made at image build (Dockerfile), in this same image; otherwise worked out here once
+        try:
+            b = json.load(open(HERE / "map" / "tpcds_fp.json"))
+        except Exception:  # noqa
+            b = eq_fingerprints({}, None, 60)
+        _EQ_BASE.append(b if b else None)
+    base = _EQ_BASE[0]
+    if not base:
+        why.append("tpcds check: no baseline")
+        return False
+    got = eq_fingerprints(payload, base, 60)
+    if got not in ("same", "pass"):
+        why.append(f"tpcds check: inputs differ" if got is not None else "tpcds check: no result")
+        return False
+    why.append("tpcds inputs unchanged -> drop test_execute_tpcds" if got == "same" else
+               "tpcds: only some queries changed, ran them here, all pass -> drop test_execute_tpcds")
+    return True
+
+
 def main():
     tests_json = json.loads((DATA / "tests.json").read_text())
     tests = tests_json["tests"]
@@ -2155,6 +2371,12 @@ def main():
                 nums = sorted(set(nums) | set(unknown))
             if not unknown and not any("-> all" in w for w in why):
                 nums = refine(nums, secs, ids, ctx, why)
+                # still keeping test_execute_tpcds (no cheap run, or a cheap test failed)
+                tn = [n for n in nums if ids[n] == TPCDS_ID]
+                if tn and ids[tn[0]] not in ctx.get("keep_ids", set()):
+                    rest = [n for n in nums if n != tn[0]]
+                    if pack_cost(nums, secs) - pack_cost(rest, secs) > 6 and eq_check(ctx, patch.read_text(errors="replace"), why):
+                        nums = rest
         except Exception as e:  # never crash: run everything for this commit
             log(f"{patch.stem}: error {e!r}; running all")
             nums = [t["number"] for t in tests]
