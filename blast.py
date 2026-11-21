@@ -190,11 +190,20 @@ def parse_patch(text):
 
 
 def apply_hunks(old_text, hunks):
+    """apply unified-diff hunks; raises ValueError if a hunk's context does not match the pinned file"""
     old = old_text.split("\n")
     new = []
     pos = 0  # 0-based index into old
     for ostart, body in hunks:
         start = ostart - 1 if ostart > 0 else 0
+        want = [text for tag, text in body if tag in " -"]
+
+        def fits(at):
+            return at >= pos and old[at:at + len(want)] == want
+
+        if want and not fits(start):
+            # the line numbers everything else uses would be wrong too
+            raise ValueError("patch does not apply at its stated lines")
         new.extend(old[pos:start])
         pos = start
         for tag, text in body:
@@ -409,12 +418,15 @@ def functions_by_name(tree):
     return out
 
 
-def scope_changes(old_tree, new_tree):
+def scope_changes(old_tree, new_tree, lines):
     """functions whose name scoping changed (a nonlocal/global added or removed, or a name that is read
-    becoming local or global): every line of such a function can behave differently"""
+    becoming local or global): every line of such a function can behave differently.
+    Only functions spanning one of the changed old `lines` can change."""
     old_f, new_f = functions_by_name(old_tree), functions_by_name(new_tree)
     out = []
     for q, fo in old_f.items():
+        if not any(fo.lineno <= ln <= fo.end_lineno for ln in lines):
+            continue
         fnew = new_f.get(q)
         if fnew is None:
             continue
@@ -444,7 +456,8 @@ def select_python(path, old_text, hunks, why):
         return set()
 
     scope_extra = set()
-    for q, fo in scope_changes(old_tree, new_tree):
+    _rem, _ins = changed_old_lines(hunks)
+    for q, fo in scope_changes(old_tree, new_tree, _rem | _ins | {p - 1 for p in _ins}):
         got = line_tests(path, func_body_lines(fo))
         why.append(f"{path}: scoping changed in {'.'.join(q)} -> {len(got)}")
         scope_extra |= got
