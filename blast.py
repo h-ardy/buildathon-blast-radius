@@ -543,8 +543,11 @@ def select_python(path, old_text, hunks, why):
     gone = set(gone_mod)
     for q, names in gone_cls.items():
         gone |= names
+    if path.startswith(TEST_IMPORT_FILES):
+        NEED_TEST_IMPORTS[0] = True
     if gone:
         NEED_IMPORT_CHECK[0] = True
+        NEED_TEST_IMPORTS[0] = True
         got = attr_ref_users(gone) | mention_tests(gone)
         if gone_mod:
             got |= name_users(path, gone_mod, why, 0)
@@ -655,6 +658,8 @@ def select_python(path, old_text, hunks, why):
 
     if import_level:
         NEED_IMPORT_CHECK[0] = True
+        if any(not any(isinstance(n, ast.ClassDef) for n in (it[2] or ())) for it in import_level):
+            NEED_TEST_IMPORTS[0] = True
         # group by statement so a multi-line table is analysed once
         seen, items = set(), []
         for it in import_level:
@@ -1110,6 +1115,16 @@ def new_class_stmt(new_tree, class_names, attr):
 
 
 NEED_IMPORT_CHECK = [False]
+# whether the import check must also import every test module. Test modules only run sqlglot code at
+# import time through these files (measured at the pinned commit), so other changes can only break a
+# test module's import by removing a name it uses, or through module-level code.
+NEED_TEST_IMPORTS = [False]
+TEST_IMPORT_FILES = ("sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py",
+                     "sqlglot/optimizer/__init__.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py",
+                     "sqlglot/helper.py", "sqlglot/parser.py", "sqlglot/generator.py", "sqlglot/expressions/",
+                     "sqlglot/errors.py", "sqlglot/_typing.py", "sqlglot/trie.py", "sqlglot/schema.py",
+                     "sqlglot/executor/__init__.py", "sqlglot/time.py")
+TEST_IMPORTS_ALWAYS = os.environ.get("BR_TEST_IMPORTS_ALWAYS", "0") == "1"
 _TRIG_CACHE = {}
 
 
@@ -1607,7 +1622,8 @@ def import_check(patched, test_patches=None):
             mod = mod[: -len(".__init__")]
         payload[mod] = [str(SG_TREE / path), text]
     with tempfile.NamedTemporaryFile("w", suffix=".json", dir="/tmp", delete=False) as fh:
-        json.dump({"patched": payload, "tests": TEST_MODULES}, fh)
+        need_tests = NEED_TEST_IMPORTS[0] or TEST_IMPORTS_ALWAYS or bool(test_patches)
+        json.dump({"patched": payload, "tests": TEST_MODULES if need_tests else []}, fh)
         name = fh.name
     try:
         if FORK and FORK_OK[0]:
@@ -1655,6 +1671,7 @@ def select_commit(patch_text, why, ctx=None):
     ctx["tests"] = test_patches
     kinds = set()
     NEED_IMPORT_CHECK[0] = False
+    NEED_TEST_IMPORTS[0] = False
     for f in parse_patch(patch_text):
         path = f["old"] if f["status"] != "added" else f["new"]
         newpath = f["new"]
@@ -1718,6 +1735,7 @@ def select_commit(patch_text, why, ctx=None):
                 kinds.add("code")
                 patched[path] = apply_hunks(old_text, f["hunks"])
                 if f["status"] == "added":
+                    NEED_TEST_IMPORTS[0] = True
                     out |= new_module_tests(path, f["hunks"], why)
                 else:
                     out |= select_python(path, old_text, f["hunks"], why)
@@ -1840,11 +1858,11 @@ def pack(nums, secs):
 SPEC_E = os.environ.get("BR_SPEC_E", "1") == "1"      # drop expensive tests when every cheap one passes
 RUN_SMALL = os.environ.get("BR_RUN_SMALL", "1") == "1"  # run small selections, keep only failures
 EXP_T = 2.0       # "expensive": not worth running here
-BIG_T = float(os.environ.get("BR_BIG_T", "5.0"))   # worth betting on
+BIG_T = float(os.environ.get("BR_BIG_T", "2.0"))   # worth betting on once cheap tests pass
 MIN_EVIDENCE = 3  # cheap tests that must pass before a big one is dropped
 PARTIAL = os.environ.get("BR_PARTIAL", "0") == "1"     # also run the cheap part of a selection with costly tests
 RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
-NO_ANYK = os.environ.get("BR_NO_ANYK", "0") == "1"   # experiment only
+NO_ANYK = os.environ.get("BR_NO_ANYK", "1") == "1"   # a test that reads a table but never looks up an entry is not affected by entry changes
 SPEC_RATIO = float(os.environ.get("BR_SPEC_RATIO", "1.0"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
