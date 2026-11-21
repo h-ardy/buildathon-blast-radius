@@ -370,6 +370,61 @@ def scope_classes(path, chain):
     return [f"{modname}." + ".".join(classes)]
 
 
+def scope_info(fn):
+    """names a function declares nonlocal/global, binds, and reads (nested scopes included)"""
+    decl, stores, loads = set(), set(), set()
+    a = fn.args
+    for arg in a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]:
+        stores.add(arg.arg)
+    for node in ast.walk(ast.Module(body=fn.body, type_ignores=[])):
+        if isinstance(node, ast.Nonlocal):
+            decl.update(("nonlocal", n) for n in node.names)
+        elif isinstance(node, ast.Global):
+            decl.update(("global", n) for n in node.names)
+        elif isinstance(node, ast.Name):
+            (loads if isinstance(node.ctx, ast.Load) else stores).add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            stores.add(node.name)
+        elif isinstance(node, ast.alias):
+            stores.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            stores.add(node.name)
+    return decl, stores - {n for _, n in decl}, loads
+
+
+def functions_by_name(tree):
+    out = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                q = prefix + (child.name,)
+                if not isinstance(child, ast.ClassDef):
+                    out.setdefault(q, child)
+                walk(child, q)
+            else:
+                walk(child, prefix)
+
+    walk(tree, ())
+    return out
+
+
+def scope_changes(old_tree, new_tree):
+    """functions whose name scoping changed (a nonlocal/global added or removed, or a name that is read
+    becoming local or global): every line of such a function can behave differently"""
+    old_f, new_f = functions_by_name(old_tree), functions_by_name(new_tree)
+    out = []
+    for q, fo in old_f.items():
+        fnew = new_f.get(q)
+        if fnew is None:
+            continue
+        d0, s0, l0 = scope_info(fo)
+        d1, s1, l1 = scope_info(fnew)
+        if d0 != d1 or ((s0 ^ s1) & (l0 | l1)):
+            out.append((q, fo))
+    return out
+
+
 def select_python(path, old_text, hunks, why):
     new_text = apply_hunks(old_text, hunks)
     try:
@@ -388,6 +443,11 @@ def select_python(path, old_text, hunks, why):
         why.append(f"{path}: same AST")
         return set()
 
+    scope_extra = set()
+    for q, fo in scope_changes(old_tree, new_tree):
+        got = line_tests(path, func_body_lines(fo))
+        why.append(f"{path}: scoping changed in {'.'.join(q)} -> {len(got)}")
+        scope_extra |= got
     removed, inserts = changed_old_lines(hunks)
     index = stmt_index(old_tree)
     spans = string_spans(old_tree)
@@ -486,7 +546,7 @@ def select_python(path, old_text, hunks, why):
                 seen.add(k)
                 items.append(it)
         out |= import_level_tests(path, items, why, new_tree)
-    return out
+    return out | scope_extra
 
 
 # ---- class attributes -------------------------------------------------------------------
@@ -1287,7 +1347,8 @@ def select_test_py(path, old_text, hunks, why):
 
 CHECK_SCRIPT = r"""
 import importlib, importlib.abc, importlib.util, json, os, pkgutil, sys
-P = json.load(open(sys.argv[1]))
+D = json.load(open(sys.argv[1]))
+P = D["patched"]
 class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def find_spec(self, name, path, target=None):
         if name not in P:
@@ -1316,6 +1377,14 @@ for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
 from sqlglot.dialects.dialect import Dialect
 for d in list(Dialect.classes):
     Dialect.get_or_raise(d)
+# test modules that no longer import: every test in them fails
+bad = []
+for name in D.get("tests", []):
+    try:
+        importlib.import_module(name)
+    except BaseException:
+        bad.append(name)
+sys.stdout.write("\n" + json.dumps(bad) + "\n")
 """
 SG_TREE = HERE / "sg"
 # one thread per numeric library: the scorer counts threads against a 256-process limit
@@ -1325,34 +1394,49 @@ THREAD_ENV = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_N
 THREAD_ENV["LANG"] = "C.UTF-8"
 
 
-def import_check(patched):
-    """True if sqlglot with these patched modules still imports (every module, every dialect)."""
+TEST_MODULES = sorted({f[:-3].replace("/", ".") for f in BY_FILE if f.endswith(".py")})
+
+
+def import_check(patched, test_patches=None):
+    """-> (ok, test files that no longer import). ok is False if sqlglot with these patched modules no
+    longer imports (every module, every dialect)."""
     import subprocess
     import tempfile
 
     if not SG_TREE.exists():
-        return True
+        return True, []
     payload = {}
-    for path, text in patched.items():
+    for path, text in list(patched.items()) + [(p, t) for p, t in (test_patches or {}).items()
+                                           if p.endswith(".py") and isinstance(t, str)]:
         mod = path[:-3].replace("/", ".")
         if mod.endswith(".__init__"):
             mod = mod[: -len(".__init__")]
         payload[mod] = [str(SG_TREE / path), text]
     with tempfile.NamedTemporaryFile("w", suffix=".json", dir="/tmp", delete=False) as fh:
-        json.dump(payload, fh)
+        json.dump({"patched": payload, "tests": TEST_MODULES}, fh)
         name = fh.name
     try:
+        if FORK and FORK_OK[0]:
+            try:
+                ok, bad = check_forked(name, 60)
+                if not ok:
+                    log("import check failed")
+                return ok, [m.replace(".", "/") + ".py" for m in bad]
+            except OSError as e:  # no fork here: use a fresh interpreter instead
+                log(f"fork unavailable {e!r}")
+                FORK_OK[0] = False
         r = subprocess.run([sys.executable, "-c", CHECK_SCRIPT, name], cwd="/tmp",
                            env=dict(THREAD_ENV, PYTHONPATH=str(SG_TREE), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
-                                    PATH=os.environ.get("PATH", "")),
+                                    PATH=os.environ.get("PATH", ""), SKIP_INTEGRATION="0"),
                            capture_output=True, text=True, timeout=60)
-        ok = r.returncode == 0
-        if not ok:
+        if r.returncode != 0:
             log("import check failed: " + r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else "import check failed")
-        return ok
+            return False, []
+        bad = json.loads(r.stdout.strip().splitlines()[-1])
+        return True, [m.replace(".", "/") + ".py" for m in bad]
     except Exception as e:
         log(f"import check error {e!r}")
-        return False
+        return False, []
     finally:
         try:
             os.unlink(name)
@@ -1452,11 +1536,14 @@ def select_commit(patch_text, why, ctx=None):
     ctx["fixture_only"] = kinds == {"fixture"}
     ctx["has_fixture"] = "fixture" in kinds
     if NEED_IMPORT_CHECK[0] and patched and len(out) < len(ALL):
-        if not import_check(patched):
+        ok, bad = import_check(patched, ctx.get("tests"))
+        if not ok:
             why.append("patched sqlglot fails to import -> all")
             out |= ALL
         else:
-            why.append("import check ok")
+            for f in bad:
+                out |= BY_FILE.get(f, set())
+            why.append(f"import check ok; test files that no longer import: {bad}" if bad else "import check ok")
     return out
 
 
@@ -1539,6 +1626,8 @@ RUN_SMALL = os.environ.get("BR_RUN_SMALL", "1") == "1"  # run small selections, 
 EXP_T = 2.0       # "expensive": not worth running here
 BIG_T = float(os.environ.get("BR_BIG_T", "5.0"))   # worth betting on
 MIN_EVIDENCE = 3  # cheap tests that must pass before a big one is dropped
+PARTIAL = os.environ.get("BR_PARTIAL", "0") == "1"     # also run the cheap part of a selection with costly tests
+RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
 START = None
@@ -1572,6 +1661,128 @@ def overlay_tests(test_patches):
     return root
 
 
+FORK = os.environ.get("BR_FORK", "1") == "1"   # run tests in a forked copy of this process
+FORK_OK = [True]
+_WARM = [False]
+
+
+def warm_up():
+    """Load the test libraries once here, so each forked test run starts with them loaded."""
+    if _WARM[0]:
+        return
+    _WARM[0] = True
+    os.environ.update(THREAD_ENV)
+    os.environ["HOME"] = "/tmp"
+    sys.path.insert(1, str(HERE))
+    import runner  # noqa: F401
+
+    for name in ("unittest.mock", "multiprocessing", "sqlite3", "decimal", "csv", "datetime", "tempfile",
+                 "numpy", "duckdb", "pandas", "pandas.testing"):
+        try:
+            importlib_import(name)
+        except Exception:  # noqa
+            pass
+
+
+def importlib_import(name):
+    import importlib
+
+    return importlib.import_module(name)
+
+
+def fork_call(func, budget):
+    """func() -> bytes, run in a forked child of this process; -> bytes, or None if it failed or timed out"""
+    import gc
+    import select as _select  # the standard library module (this file is blast.py)
+    import signal
+    import time
+
+    warm_up()
+    gc.freeze()  # the child would otherwise copy every page of this process when its gc walks old objects
+    r, w = os.pipe()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:  # child: never returns
+        code = 1
+        try:
+            os.close(r)
+            fd = os.open(os.devnull, os.O_RDWR)
+            os.dup2(fd, 0)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+            os.chdir("/tmp")
+            sys.dont_write_bytecode = True
+            os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+            os.environ["PYTHONPATH"] = str(SG_TREE)
+            os.environ["SKIP_INTEGRATION"] = "0"
+            sys.path.insert(0, str(SG_TREE))
+            view = memoryview(func())
+            while view:
+                n = os.write(w, view)
+                view = view[n:]
+            code = 0
+        except BaseException:  # noqa
+            code = 1
+        finally:
+            os._exit(code)
+    os.close(w)
+    chunks = []
+    deadline = time.time() + budget
+    ok = False
+    try:
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            ready, _, _ = _select.select([r], [], [], left)
+            if not ready:
+                break
+            chunk = os.read(r, 1 << 16)
+            if not chunk:
+                ok = True
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(r)
+        if not ok:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        _, status = os.waitpid(pid, 0)
+    if not ok or status != 0:
+        log("forked call failed" if ok else "forked call timed out")
+        return None
+    return b"".join(chunks)
+
+
+def run_forked(spec, budget):
+    """run the spec in a forked child; -> set of failing ids, or None"""
+
+    def job():
+        import runner
+
+        runner.prepare(spec)
+        return json.dumps({"failed": sorted(runner.run(spec))}).encode()
+
+    out = fork_call(job, budget)
+    return None if out is None else set(json.loads(out.decode())["failed"])
+
+
+def check_forked(spec_file, budget):
+    """the import check in a forked child; -> (ok, bad test modules)"""
+
+    def job():
+        sys.argv = ["check", spec_file]
+        g = {"__name__": "__check__"}
+        exec(compile(CHECK_SCRIPT, "<check>", "exec"), g)
+        return json.dumps(g["bad"]).encode()
+
+    out = fork_call(job, budget)
+    return (False, []) if out is None else (True, json.loads(out.decode()))
+
+
 def run_here(ids, patched, test_patches, failfast, budget):
     """-> set of failing ids, or None if the run could not finish"""
     import subprocess
@@ -1591,6 +1802,19 @@ def run_here(ids, patched, test_patches, failfast, budget):
             mod = mod[: -len(".__init__")]
         payload[mod] = [str(SG_TREE / path), text]
     spec = {"patched": payload, "tests": ids, "tests_root": root, "failfast": failfast}
+    if FORK and FORK_OK[0]:
+        try:
+            return run_forked(spec, budget)
+        except OSError as e:  # no fork here: use a fresh interpreter instead
+            log(f"fork unavailable {e!r}")
+            FORK_OK[0] = False
+        except Exception as e:
+            log(f"fork error {e!r}")
+            return None
+        finally:
+            if ov and FORK_OK[0]:
+                import shutil
+                shutil.rmtree(ov, ignore_errors=True)
     with tempfile.NamedTemporaryFile("w", suffix=".json", dir="/tmp", delete=False) as fh:
         json.dump(spec, fh)
         name = fh.name
@@ -1645,12 +1869,14 @@ def refine(nums, secs, ids, ctx, why):
             return nums
         why.append(f"ran {len(cheap)} cheap: all pass -> drop {len(big)} big, keep {len(mid)} mid")
         return sorted(set(fixed) | set(mid))
-    if not exp and cheap and RUN_SMALL and not ctx.get("has_fixture") and est < 0.5 * base:
+    # what dropping every cheap test would save at best; worth a run if the run costs less than half of it
+    saving = base - (pack_cost(sorted(set(fixed) | set(exp)), secs) if (fixed or exp) else 0.0)
+    if (PARTIAL or not exp) and cheap and RUN_SMALL and not ctx.get("has_fixture") and est < RS_RATIO * saving:
         failed = run_here([ids[n] for n in cheap], ctx["patched"], ctx["tests"], False, 20 + 4 * est)
         if failed is None:
             return nums
-        keep = sorted(set(fixed) | {n for n in cheap if ids[n] in failed})
-        why.append(f"ran {len(cheap)}: {len(keep) - len(fixed)} fail")
+        keep = sorted(set(fixed) | set(exp) | {n for n in cheap if ids[n] in failed})
+        why.append(f"ran {len(cheap)}: {len([n for n in cheap if ids[n] in failed])} fail")
         return keep
     return nums
 

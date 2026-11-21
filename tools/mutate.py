@@ -92,7 +92,129 @@ def pick_impexec(f):
     return [ln for ln in pick_func_lines(f) if ln in lines]
 
 
+def docstring_lines(f):
+    tree = ast.parse(open(os.path.join(WORK, f)).read())
+    out = []
+    for node in [tree] + [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]:
+        b = node.body
+        if b and isinstance(b[0], ast.Expr) and isinstance(getattr(b[0], "value", None), ast.Constant) and isinstance(b[0].value.value, str):
+            out.extend(range(b[0].lineno, b[0].end_lineno + 1))
+    return out
+
+
+def defs(f):
+    tree = ast.parse(open(os.path.join(WORK, f)).read())
+    return [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+
+
+def make_extra(kind):
+    """change kinds the samples never show"""
+    f = rng.choice(py_files())
+    L = lines_of(f)
+    if kind == "docstring":
+        c = docstring_lines(f)
+        if not c:
+            return None
+        ln = rng.choice(c)
+        L[ln - 1] = L[ln - 1] + rng.choice([" Note.", " (deprecated)", " x"]) if L[ln - 1].strip() and not L[ln - 1].strip().endswith('"""') else L[ln - 1]
+        if L[ln - 1] == lines_of(f)[ln - 1]:
+            return None
+    elif kind == "deco":
+        c = [d.lineno - len(d.decorator_list) + i for d in defs(f) for i in range(len(d.decorator_list))]
+        c = [ln for ln in c if L[ln - 1].strip().startswith("@") and L[ln - 1].strip().count("(") == L[ln - 1].strip().count(")")]
+        if not c:
+            return None
+        ln = rng.choice(c)
+        del L[ln - 1]
+    elif kind == "defarg":
+        c = [d.lineno for d in defs(f) if d.args.defaults or d.args.kw_defaults]
+        c = [ln for ln in c if "=" in L[ln - 1]]
+        if not c:
+            return None
+        ln = rng.choice(c)
+        seg = L[ln - 1]
+        i = seg.index("=")
+        new = mutate_text(seg[i:])
+        if not new:
+            return None
+        L[ln - 1] = seg[:i] + new
+    elif kind == "impline":
+        tree = ast.parse("\n".join(L))
+        c = [st.lineno for st in tree.body if isinstance(st, (ast.Import, ast.ImportFrom)) and st.lineno == st.end_lineno]
+        if not c:
+            return None
+        ln = rng.choice(c)
+        del L[ln - 1]
+    elif kind == "delstmt":
+        c = pick_func_lines(f)
+        if not c:
+            return None
+        ln = rng.choice(c)
+        ind = re.match(r"\s*", L[ln - 1]).group(0)
+        if L[ln - 1].strip().startswith(("else", "elif", "except", "finally", "def ", "class ", "@", "return", "if ", "for ", "while ", "with ", "try")):
+            return None
+        L[ln - 1] = ind + "pass"
+    elif kind == "rename":
+        c = [d for d in defs(f) if not d.name.startswith("__")]
+        if not c:
+            return None
+        d = rng.choice(c)
+        ln = d.lineno
+        if f"def {d.name}(" not in L[ln - 1]:
+            return None
+        L[ln - 1] = L[ln - 1].replace(f"def {d.name}(", f"def {d.name}_v2(", 1)
+    elif kind == "ws":
+        ln = rng.randrange(1, len(L))
+        if rng.random() < 0.5:
+            L[ln - 1] = L[ln - 1] + "  "
+        else:
+            L.insert(ln - 1, "")
+    elif kind == "newmod":
+        v = rng.randrange(3)
+        body = ["def helper(x):", "    return x"]
+        if v == 1:
+            body.append("raise ImportError('broken')")
+        open(os.path.join(WORK, "sqlglot", "zz_newmod.py"), "w").write("\n".join(body) + "\n")
+        git("add", "-N", "sqlglot/zz_newmod.py")
+        if v == 2:
+            I = lines_of("sqlglot/__init__.py")
+            I.append("from sqlglot.zz_newmod import helper as _zz_helper  # noqa")
+            write("sqlglot/__init__.py", I)
+        return f"{kind} v{v}"
+    elif kind == "nonpy":
+        g = rng.choice(["README.md", "pyproject.toml", "setup.cfg", "Makefile", "CHANGELOG.md", "MANIFEST.in"])
+        G = lines_of(g)
+        G.insert(rng.randrange(len(G)), "# local note" if g != "README.md" else "Local note.")
+        write(g, G)
+        return f"{kind} {g}"
+    else:
+        return None
+    try:
+        ast.parse("\n".join(L))
+    except SyntaxError:
+        return None
+    write(f, L)
+    return f"{kind} {f}:{ln}"
+
+
+EXTRA = ("docstring", "deco", "defarg", "impline", "delstmt", "rename", "ws", "newmod", "nonpy")
+
+
 def make_mutant(kind):
+    if kind in EXTRA:
+        for _ in range(200):
+            d = make_extra(kind)
+            if d:
+                return d
+            git("checkout", "--", ".")
+        return None
+    if kind == "multi":
+        parts = []
+        for k in rng.sample(["classattr", "func", "modconst", "scalar", "defarg", "delstmt"], 2):
+            d = make_mutant(k)
+            if d:
+                parts.append(d)
+        return "multi[" + " + ".join(parts) + "]" if parts else None
     for _ in range(200):
         if kind == "testcode":
             tf = [f for f in git("ls-files", "tests").split() if f.endswith(".py") and "/fixtures/" not in f and "leakcheck" not in f and "gen_fixtures" not in f]
@@ -201,6 +323,8 @@ if __name__ == "__main__":
     num = {t["id"]: t["number"] for t in tests}
     for k in range(N):
         git("checkout", "--", ".")
+        git("reset", "-q")
+        git("clean", "-fdq", "sqlglot", "tests")
         kind = KINDS[k % len(KINDS)]
         desc = make_mutant(kind)
         if not desc:
@@ -209,6 +333,9 @@ if __name__ == "__main__":
         sel, why = select(patch)
         failed = run_suite()
         fnums = {num[x] for x in failed if x in num}
+        for x in failed:  # a test file that cannot be collected: all its tests fail
+            if x.startswith("COLLECT:"):
+                fnums |= {t["number"] for t in tests if t["file"] == x[len("COLLECT:"):]}
         other = [x for x in failed if x not in num]
         missed = sorted(fnums - sel)
         rec = {"desc": desc, "selected": len(sel), "failing": sorted(fnums), "other": other,
@@ -217,3 +344,5 @@ if __name__ == "__main__":
             fh.write(json.dumps(rec) + "\n")
         print(f"{desc}: sel={len(sel)} fail={len(fnums)} missed={missed} {other[:2]}", flush=True)
     git("checkout", "--", ".")
+    git("reset", "-q")
+    git("clean", "-fdq", "sqlglot", "tests")
