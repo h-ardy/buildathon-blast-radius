@@ -1729,6 +1729,7 @@ BIG_T = float(os.environ.get("BR_BIG_T", "5.0"))   # worth betting on
 MIN_EVIDENCE = 3  # cheap tests that must pass before a big one is dropped
 PARTIAL = os.environ.get("BR_PARTIAL", "0") == "1"     # also run the cheap part of a selection with costly tests
 RS_RATIO = float(os.environ.get("BR_RS_RATIO", "0.5"))
+SPEC_RATIO = float(os.environ.get("BR_SPEC_RATIO", "1.0"))
 UNRUNNABLE_IDS = ("tests/test_sqlglotc.py::", "::test_lazy_load", "::test_generator_memory", "::test_max_nodes",
                   "::test_no_redundant_expression_metadata")
 START = None
@@ -1965,7 +1966,10 @@ def refine(nums, secs, ids, ctx, why):
     cheap = [n for n in runn if secs[n] < EXP_T]
     est = 0.4 + 1.3 * sum(secs[n] for n in cheap)
     base = pack_cost(nums, secs)
-    if big and len(cheap) >= MIN_EVIDENCE and SPEC_E and not ctx.get("fixture_only"):
+    # dropping the big tests saves at best this much, and only if every cheap test passes
+    spec_saving = base - (pack_cost(sorted(set(fixed) | set(mid)), secs) if (fixed or mid) else 0.0)
+    if (big and len(cheap) >= MIN_EVIDENCE and SPEC_E and not ctx.get("fixture_only")
+            and est < SPEC_RATIO * spec_saving):
         failed = run_here([ids[n] for n in cheap], ctx["patched"], ctx["tests"], True, 20 + 4 * est)
         if failed is None or failed:
             why.append(f"ran {len(cheap)} cheap: {'failure' if failed else 'no result'} -> keep all")
