@@ -2498,14 +2498,66 @@ def eq_check(ctx, patch_text, why):
         return False
 
 
+GEN_REPLAY = os.environ.get("BR_GEN_REPLAY", "1") == "1"
+_GEN_FILE = re.compile(r"sqlglot/(generator|generators/(?!__init__)\w+)\.py")
+
+
+def _defs_stripped(tree):
+    """the module with every function definition taken out (classes keep their other statements)"""
+    class Strip(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            return None
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    return ast.dump(Strip().visit(tree), include_attributes=False)
+
+
+def gen_only(patch_text):
+    """True when the patch only rewrites, adds or removes function definitions in generator modules"""
+    try:
+        files = parse_patch(patch_text)
+    except Exception:  # noqa
+        return False
+    if not files:
+        return False
+    for f in files:
+        p = f["old"]
+        if f["status"] != "modified" or f["binary"] or p != f["new"] or not p or not _GEN_FILE.fullmatch(p):
+            return False
+        old = SRC.get(p)
+        if old is None:
+            return False
+        try:
+            new = apply_hunks(old, f["hunks"])
+            if _defs_stripped(ast.parse(old)) != _defs_stripped(ast.parse(new)):
+                return False
+        except (ValueError, SyntaxError):
+            return False
+    return True
+
+
+def gen_replay(payload):
+    """replay the generate calls test_execute_tpcds makes on the patched modules -> "same", "differ" or None"""
+    path = HERE / "map" / "tpcds_gen.pkl"
+    if not path.exists():
+        return None
+
+    def job():
+        import runner
+        runner.prepare({"patched": payload, "tests_root": str(SG_TREE)})
+        sys.path.insert(0, str(HERE))
+        import tpcfp
+        return tpcfp.gen_replay(str(SG_TREE), str(path)).encode()
+
+    out = fork_call(job, 30)
+    return None if out is None else out.decode()
+
+
 def _eq_check(ctx, patch_text, why):
     import time
 
     if not EQ or not (FORK and FORK_OK[0]) or ctx.get("tests") or time.time() - START > REFINE_T:
-        return False
-    reason = eq_eligible(patch_text)
-    if reason:
-        why.append(f"tpcds check n/a: {reason}")
         return False
     payload = {}
     for path, text in ctx["patched"].items():
@@ -2513,6 +2565,17 @@ def _eq_check(ctx, patch_text, why):
         if mod.endswith(".__init__"):
             mod = mod[: -len(".__init__")]
         payload[mod] = [str(SG_TREE / path), text]
+    if GEN_REPLAY and gen_only(patch_text):
+        got = gen_replay(payload)
+        if got == "same":
+            why.append("tpcds: generator-only change, every generate call the test makes returns the same text "
+                       "-> drop test_execute_tpcds")
+            return True
+        why.append(f"tpcds generator replay: {got}")
+    reason = eq_eligible(patch_text)
+    if reason:
+        why.append(f"tpcds check n/a: {reason}")
+        return False
     if not _EQ_BASE:
         # made at image build (Dockerfile), in this same image; otherwise worked out here once
         try:

@@ -158,10 +158,119 @@ def check(tree, base, max_diff):
     return "pass"
 
 
+# ----------------------------------------------------------------------------- generator replay
+# While test_execute_tpcds runs on the pinned tree, every top-level Generator.generate call is recorded:
+# generator class, its constructor arguments, the expression (pickled), and the text it returned. In
+# that run, code in sqlglot/generator.py and sqlglot/generators/ runs only inside generate, plus module
+# and class set-up and Generator.__init__ (checked with a profiler when this was written). So a patch
+# that only rewrites, adds or removes function definitions in those files can change the test only
+# through what generate returns. Replaying every recorded call on the patched modules and getting the
+# same text back means the test runs exactly as it does on the pinned tree.
+
+
+def _skip_site(tree, site):
+    """calls whose text only goes to a debug log line"""
+    path, line = site
+    try:
+        src = open(f"{tree}/{path}").read().splitlines()[line - 1]
+    except Exception:  # noqa
+        return False
+    return "logger." in src
+
+
+def gen_record(tree, out):
+    import os
+    import pickle
+
+    sys.path.insert(0, tree)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    from sqlglot import generator as G
+    from sqlglot import parse_one
+
+    gen_files = ("/generator.py", "/generators/", "/expressions/", "/dialects/dialect.py", "/sqlglot/__init__.py")
+    recs, depth, kw, keep, idx = [], [0], {}, [], {}
+    init, generate = G.Generator.__init__, G.Generator.generate
+
+    def new_init(self, *a, **k):
+        kw[id(self)] = (a, k)
+        keep.append(self)
+        init(self, *a, **k)
+
+    def new_generate(self, expression, copy=True):
+        site = None
+        if depth[0] == 0:
+            f = sys._getframe(1)
+            while f and any(x in f.f_code.co_filename for x in gen_files):
+                f = f.f_back
+            site = (os.path.relpath(f.f_code.co_filename, tree), f.f_lineno) if f else None
+            blob = pickle.dumps(expression)
+        depth[0] += 1
+        try:
+            res = generate(self, expression, copy=copy)
+        finally:
+            depth[0] -= 1
+        if depth[0] == 0 and not (site and _skip_site(tree, site)):
+            c = type(self)
+            recs.append((c.__module__, c.__qualname__, idx.setdefault(id(self), len(idx)), kw.get(id(self), ((), {})),
+                         blob, copy, res))
+        return res
+
+    G.Generator.__init__, G.Generator.generate = new_init, new_generate
+    from tests import test_executor as te
+
+    te.TestExecutor.setUpClass()
+    T = te.TestExecutor
+    inst = T("test_execute_tpcds")
+    te.initializer(te.TPCDS_SCHEMA, T.tpcds_tables)
+    for i, (meta, sql, _) in enumerate(T.tpcds_sqls):
+        if not meta.get("execute"):
+            continue
+        table = te.mp_execute(pickle.loads(pickle.dumps(parse_one(sql))), meta)
+        inst.subtestHelper(i, pickle.loads(pickle.dumps(table)), tpch=False)
+    T.tearDownClass()
+    with open(out, "wb") as fh:
+        pickle.dump({"recs": recs}, fh)
+    return len(recs)
+
+
+def gen_replay(tree, base_path):
+    """-> "same" if every recorded generate call returns the same text on the (patched) tree, else "differ" """
+    import importlib
+    import pickle
+
+    sys.path.insert(0, tree)
+    with open(base_path, "rb") as fh:
+        recs = pickle.load(fh)["recs"]
+    if not recs:
+        return "differ"
+    gens = {}
+    for mod, qn, ix, (a, k), blob, copy, res in recs:
+        try:
+            g = gens.get(ix)
+            if g is None:
+                obj = importlib.import_module(mod)
+                for part in qn.split("."):
+                    obj = getattr(obj, part)
+                g = gens[ix] = obj(*a, **k)
+            out = g.generate(pickle.loads(blob), copy=copy)
+        except Exception:  # noqa
+            return "differ"
+        if out != res:
+            return "differ"
+    return "same"
+
+
 if __name__ == "__main__":
     # at image build: python tpcfp.py SG_TREE OUT.json (the pinned tree's fingerprints)
+    # or python tpcfp.py --gen SG_TREE OUT.pkl (the generator calls test_execute_tpcds makes)
     import json
     import os
 
     os.chdir("/tmp")
-    json.dump(fingerprints(sys.argv[1], "tpcds"), open(sys.argv[2], "w"))
+    if sys.argv[1] == "--gen":
+        n = gen_record(sys.argv[2], sys.argv[3])
+        print("generate calls", n)
+        if n < 1000:
+            raise SystemExit("too few generate calls")
+    else:
+        json.dump(fingerprints(sys.argv[1], "tpcds"), open(sys.argv[2], "w"))

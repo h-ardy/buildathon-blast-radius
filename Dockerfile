@@ -12,5 +12,8 @@ RUN mkdir /app/sg && tar xzf /app/map/src.tar.gz -C /app/sg && tar xzf /app/map/
 # the pinned tree's tpcds fingerprints, made once here (blast.py works them out itself if this fails)
 RUN cd /tmp && (python /app/tpcfp.py /app/sg /app/map/tpcds_fp.json || rm -f /app/map/tpcds_fp.json) \
     && chmod -R a+rX /app/map
+# the generate calls the tpcds test makes on the pinned tree, recorded once here (no file: check skipped)
+RUN cd /tmp && (python /app/tpcfp.py --gen /app/sg /app/map/tpcds_gen.pkl || rm -f /app/map/tpcds_gen.pkl) \
+    && chmod -R a+rX /app/map
 ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/blast.py"]
