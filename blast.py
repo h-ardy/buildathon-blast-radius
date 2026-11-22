@@ -2467,6 +2467,10 @@ def main():
         except Exception as e:  # never crash: run everything for this commit
             log(f"{patch.stem}: error {e!r}; running all")
             nums = [t["number"] for t in tests]
+        # PROBE BUILD, never a final entry: drop test_execute_tpcds only when the tpcds check could not
+        # apply because the change runs in the executor part or sits outside a function
+        if any("tpcds check n/a" in w and ("runs in the executor part" in w or "change outside a function" in w) for w in why):
+            nums = [n for n in nums if ids[n] != TPCDS_ID]
         workers = pack(nums, secs)
         print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
         log(f"{patch.stem}: {len(nums)} tests, {len(workers)} workers | " + "; ".join(why)[:400])
