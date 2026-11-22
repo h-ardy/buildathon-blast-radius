@@ -9,12 +9,17 @@ The safe answer can cost time, never a miss and never a rejected run.
 import json
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 REAL_OUT = sys.stdout
 ANSWERED = set()
+LOCK = threading.RLock()
+# the scorer stops a batch after 3 minutes (4.5 in the final); past this, every open commit gets the
+# safe answer and the process ends, so a stuck selector can never time the whole batch out
+WATCHDOG = float(os.environ.get("BR_WATCHDOG", "160"))
 
 
 def log(msg):
@@ -45,16 +50,18 @@ def safe_workers(secs):
 
 
 def emit(line):
-    REAL_OUT.write(line + "\n")
-    REAL_OUT.flush()
+    with LOCK:
+        REAL_OUT.write(line + "\n")
+        REAL_OUT.flush()
 
 
 def safe_answer(commit, secs, why):
-    if commit in ANSWERED:
-        return
-    ANSWERED.add(commit)
-    log(f"{commit}: safe answer (every test): {why}")
-    emit(json.dumps({"commit": commit, "workers": safe_workers(secs)}))
+    with LOCK:
+        if commit in ANSWERED:
+            return
+        ANSWERED.add(commit)
+        log(f"{commit}: safe answer (every test): {why}")
+        emit(json.dumps({"commit": commit, "workers": safe_workers(secs)}))
 
 
 def check(text, valid, secs, known):
@@ -107,13 +114,14 @@ class Filter:
     def write(self, s):
         if os.getpid() != self.pid:  # a forked child: never speaks for the batch
             return len(s)
-        self.buf += s
-        while "\n" in self.buf:
-            line, self.buf = self.buf.split("\n", 1)
-            if line.strip():
-                out = check(line.strip(), self.valid, self.secs, self.known)
-                if out is not None:
-                    emit(out)
+        with LOCK:
+            self.buf += s
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                if line.strip():
+                    out = check(line.strip(), self.valid, self.secs, self.known)
+                    if out is not None:
+                        emit(out)
         return len(s)
 
     def flush(self):
@@ -135,6 +143,22 @@ def main():
         raise
     flt = Filter(set(secs), secs, known)
     sys.stdout = flt
+
+    def watchdog():
+        if os.getpid() != flt.pid:
+            return
+        with LOCK:
+            log(f"watchdog: {WATCHDOG:.0f} s reached")
+            for c in sorted(known - ANSWERED):
+                safe_answer(c, secs, "out of time")
+            try:
+                sys.stderr.flush()
+            finally:
+                os._exit(0)
+
+    timer = threading.Timer(WATCHDOG, watchdog)
+    timer.daemon = True
+    timer.start()
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
@@ -153,8 +177,10 @@ def main():
             out = check(flt.buf.strip(), flt.valid, secs, known)
             if out is not None:
                 emit(out)
-        for c in sorted(known - ANSWERED):
-            safe_answer(c, secs, "no answer from the selector")
+        with LOCK:
+            for c in sorted(known - ANSWERED):
+                safe_answer(c, secs, "no answer from the selector")
+            timer.cancel()
 
 
 if __name__ == "__main__":
