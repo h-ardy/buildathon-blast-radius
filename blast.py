@@ -2750,8 +2750,22 @@ def main():
                 tn = [n for n in nums if ids[n] == TPCDS_ID]
                 if tn and ids[tn[0]] not in ctx.get("keep_ids", set()):
                     rest = [n for n in nums if n != tn[0]]
-                    if pack_cost(nums, secs) - pack_cost(rest, secs) > 6 and eq_check(ctx, patch.read_text(errors="replace"), why):
+                    # SPEED EXPERIMENT, not a final entry: no input check; keep test_execute_tpcds only on
+                    # evidence that this commit breaks things (a cheaper test failed here, or a file the
+                    # test reads changed)
+                    hit = any(re.search(r"ran \d+ cheap: (failure|no result)|ran \d+: [1-9]\d* fail", w) for w in why)
+                    reads = False
+                    if ctx.get("tests"):
+                        try:
+                            reads = not all(tpcds_free_test(f) for f in parse_patch(patch.read_text(errors="replace"))
+                                            if (f["old"] or f["new"] or "").startswith("tests/"))
+                        except Exception:  # noqa
+                            reads = True
+                    if not hit and not reads:
+                        why.append("SPEED: drop test_execute_tpcds without a check")
                         nums = rest
+                    else:
+                        why.append("SPEED: keep test_execute_tpcds (failure evidence)")
         except Exception as e:  # never crash: run everything for this commit
             log(f"{patch.stem}: error {e!r}; running all")
             nums = [t["number"] for t in tests]
