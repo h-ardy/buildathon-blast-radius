@@ -2469,7 +2469,7 @@ def main():
             why.append("error -> all")
             nums = [t["number"] for t in tests]
         # PROBE BUILD, never a final entry: the run-everything fallback lists nothing, to measure what it costs on the board
-        if any("-> all" in w for w in why) or any("error" in w for w in why):
+        if any("-> all" in w for w in why) or "error -> all" in why:
             nums = []
         workers = pack(nums, secs)
         print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
