@@ -1616,6 +1616,65 @@ for name in D.get("tests", []):
         bad.append(name)
 sys.stdout.write("\n" + json.dumps(bad) + "\n")
 """
+DETAIL_SCRIPT = r"""
+import importlib, importlib.abc, importlib.util, json, os, pkgutil, sys
+D = json.load(open(sys.argv[1]))
+P = D["patched"]
+GONE = set(D.get("deleted", []))
+class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def find_spec(self, name, path, target=None):
+        if name in GONE:
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        if name not in P:
+            return None
+        fn, src = P[name]
+        pkg = fn.endswith("__init__.py")
+        spec = importlib.util.spec_from_loader(name, self, origin=fn, is_package=pkg)
+        if pkg:
+            spec.submodule_search_locations = [os.path.dirname(fn)]
+        spec.has_location = True
+        return spec
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        fn, src = P[module.__name__]
+        module.__file__ = fn
+        exec(compile(src, fn, "exec"), module.__dict__)
+sys.meta_path.insert(0, Finder())
+import logging
+logging.disable(logging.CRITICAL)
+res = {"core": True, "fails": [], "dialects": [], "bad": []}
+try:
+    import sqlglot
+except BaseException:
+    res["core"] = False
+if res["core"]:
+    names = [i.name for i in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot.", onerror=lambda n: None)]
+    names += sorted(GONE)
+    for name in names:
+        if name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(name)
+        except BaseException:
+            res["fails"].append(name)
+    try:
+        from sqlglot.dialects import DIALECTS
+        from sqlglot.dialects.dialect import Dialect
+        for d in DIALECTS:
+            try:
+                Dialect.get_or_raise(d.lower())
+            except BaseException:
+                res["dialects"].append(d)
+    except BaseException:
+        res["core"] = False
+    for name in D.get("tests", []):
+        try:
+            importlib.import_module(name)
+        except BaseException:
+            res["bad"].append(name)
+sys.stdout.write("\n" + json.dumps(res) + "\n")
+"""
 SG_TREE = HERE / "sg"
 # one thread per numeric library: the scorer counts threads against a 256-process limit
 THREAD_ENV = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -1673,6 +1732,126 @@ def import_check(patched, test_patches=None):
             os.unlink(name)
         except OSError:
             pass
+
+
+NARROW = os.environ.get("BR_NARROW", "1") == "1"
+ALWAYS_ON_LOAD_FAIL = ("tests/test_dialect_imports.py", "tests/test_dialect_entry_points.py")
+
+
+_LAZY = {}
+
+
+def lazy_importers():
+    """module name -> sqlglot files that import it anywhere (module level or inside functions)"""
+    if _LAZY:
+        return _LAZY
+    for path in SRC:
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            continue
+        try:
+            tree = tree_of(path)
+        except Exception:  # noqa
+            continue
+        pkg = (M["modnames"].get(path) or path[:-3].replace("/", "."))
+        if not path.endswith("__init__.py"):
+            pkg = pkg.rsplit(".", 1)[0]
+        for node in ast.walk(tree):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if node.level:
+                    parts = pkg.split(".")
+                    parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                    base = ".".join(parts + ([base] if base else []))
+                mods = [base] + [f"{base}.{a.name}" for a in node.names]
+            for m in mods:
+                while m:
+                    _LAZY.setdefault(m, set()).add(path)
+                    m = m.rsplit(".", 1)[0] if "." in m else ""
+    return _LAZY
+
+
+def load_failure_tests(patched, deleted, why, test_patches=None):
+    """A patch that deletes a sqlglot module or makes one fail to import: -> the tests that load a
+    broken module, or None when sqlglot itself no longer imports (or the check fails), meaning all.
+    Broken modules are found by importing every module and dialect with the patch applied."""
+    if not NARROW or not (FORK and FORK_OK[0]) or not SG_TREE.exists():
+        return None
+    import tempfile
+
+    payload = {}
+    for path, text in list(patched.items()) + [(p, t) for p, t in (test_patches or {}).items()
+                                               if p.endswith(".py") and isinstance(t, str)]:
+        mod = path[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        payload[mod] = [str(SG_TREE / path), text]
+    gone = []
+    for path in deleted:
+        mod = path[:-3].replace("/", ".")
+        gone.append(mod[: -len(".__init__")] if mod.endswith(".__init__") else mod)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", dir="/tmp", delete=False) as fh:
+        json.dump({"patched": payload, "deleted": gone, "tests": TEST_MODULES}, fh)
+        name = fh.name
+
+    def job():
+        sys.argv = ["detail", name]
+        g = {"__name__": "__detail__"}
+        exec(compile(DETAIL_SCRIPT, "<detail>", "exec"), g)
+        return json.dumps(g["res"]).encode()
+
+    try:
+        out = fork_call(job, 90)
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+    if out is None:
+        return None
+    res = json.loads(out.decode())
+    if not res["core"]:
+        why.append("sqlglot itself no longer imports")
+        return None
+    by_mod = {v: k for k, v in M["modnames"].items()}
+    paths = set()
+    for m in res["fails"]:
+        p = by_mod.get(m) or (m.replace(".", "/") + ".py")
+        paths.add(p)
+    for d in res["dialects"]:
+        paths.add(f"sqlglot/dialects/{d.lower()}.py")
+    if not paths and not res["bad"]:
+        # the plain import check failed but nothing breaks here: do not guess
+        return None
+    out_tests = set()
+    lazy = lazy_importers()
+    for p in paths:
+        out_tests |= module_runtime_users(p) | dialect_users_of_module(p)
+        # modules that import it anywhere, also inside functions: tests running their code
+        for q in lazy.get(M["modnames"].get(p) or p[:-3].replace("/", "."), ()):
+            out_tests |= module_runtime_users(q)
+        # tests whose code imports the module, also inside functions
+        mod = M["modnames"].get(p) or p[:-3].replace("/", ".")
+        last = mod.rsplit(".", 1)[-1]
+        for f in BY_FILE:
+            if not f.endswith(".py"):
+                continue
+            try:
+                src = (SG_TREE / f).read_text(errors="replace")
+            except OSError:
+                out_tests |= BY_FILE[f]
+                continue
+            if mod in src or re.search(rf"^\s*(from\s+\S+\s+)?import\s.*\b{re.escape(last)}\b", src, re.M):
+                out_tests |= BY_FILE[f]
+    for m in res["bad"]:
+        out_tests |= BY_FILE.get(m.replace(".", "/") + ".py", set(ALL))
+    for f in ALWAYS_ON_LOAD_FAIL:
+        out_tests |= BY_FILE.get(f, set())
+    why.append(f"broken modules {sorted(paths)[:6]}{'...' if len(paths) > 6 else ''}, "
+               f"broken test files {len(res['bad'])} -> {len(out_tests)}")
+    return out_tests
 
 
 def keep_gone(ctx, path, got):
@@ -1738,6 +1917,9 @@ def select_commit(patch_text, why, ctx=None):
             ctx["unknown_files"] = True
             continue
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
+            if f["status"] == "deleted" and path.startswith("sqlglot/"):
+                ctx.setdefault("deleted", []).append(path)
+                continue
             if f["status"] == "deleted":
                 got = deleted_file_tests(path, why)
                 out |= got
@@ -1790,11 +1972,23 @@ def select_commit(patch_text, why, ctx=None):
         why.append(f"{path}: not loaded by tests -> nothing")
     ctx["fixture_only"] = kinds == {"fixture"}
     ctx["has_fixture"] = "fixture" in kinds
-    if NEED_IMPORT_CHECK[0] and patched and len(out) < len(ALL):
+    if ctx.get("deleted"):
+        ctx["no_local_runs"] = True  # local runs would load the deleted module from the pinned tree
+        got = load_failure_tests(patched, ctx["deleted"], why, ctx.get("tests"))
+        if got is None:
+            why.append(f"{ctx['deleted'][0]}: deleted module -> all")
+            out |= ALL
+        else:
+            out |= got
+    elif NEED_IMPORT_CHECK[0] and patched and len(out) < len(ALL):
         ok, bad = import_check(patched, ctx.get("tests"))
-        if not ok:
+        got = None if ok else load_failure_tests(patched, [], why, ctx.get("tests"))
+        if not ok and got is None:
             why.append("patched sqlglot fails to import -> all")
             out |= ALL
+        elif not ok:
+            ctx["no_local_runs"] = True
+            out |= got
         else:
             for f in bad:
                 out |= BY_FILE.get(f, set())
@@ -2276,7 +2470,7 @@ def eq_eligible(patch_text):
     return None
 
 
-EQ_MAX_DIFF = int(os.environ.get("BR_EQ_MAX_DIFF", "4"))
+EQ_MAX_DIFF = int(os.environ.get("BR_EQ_MAX_DIFF", "8"))
 
 
 def eq_fingerprints(patched, base, budget):
@@ -2455,7 +2649,7 @@ def main():
             nums = sorted({map_to_num[i] for i in sel if i in map_to_num})
             if nums or any("-> all" in w for w in why):
                 nums = sorted(set(nums) | set(unknown))
-            if not unknown and not any("-> all" in w for w in why):
+            if not unknown and not any("-> all" in w for w in why) and not ctx.get("no_local_runs"):
                 nums = op_narrow(nums, ctx, patch.read_text(errors="replace"), why)
                 nums = refine(nums, secs, ids, ctx, why)
                 # still keeping test_execute_tpcds (no cheap run, or a cheap test failed)

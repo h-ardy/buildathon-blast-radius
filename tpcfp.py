@@ -126,7 +126,7 @@ def run_queries(tree, idx):
     T.tearDownClass()
 
 
-RUN_CAP = 12
+RUN_CAP = 15
 
 
 def check(tree, base, max_diff):
