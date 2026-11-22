@@ -970,8 +970,9 @@ def dispatch_readers(c, keys):
     return out
 
 
-def keyed_readers(c, a, keys, star=True):
-    """tests that looked up one of `keys` in (c, a), iterated it, or read it in a way not recorded per key"""
+def keyed_readers(c, a, keys, star=True, loose=True):
+    """tests that looked up one of `keys` in (c, a), iterated it, or read it in a way not recorded per key
+    (loose=False: leave out tests that only read the attribute and never looked anything up in it)"""
     out = set()
     d = AKEYS.get(c, {}).get(a, {})
     for k in keys:
@@ -988,7 +989,7 @@ def keyed_readers(c, a, keys, star=True):
     r = readers(c, a)
     s = AANY.get(c, {}).get(a)
     anyk = set(SETS[s]) if s is not None else set()
-    if not NO_ANYK:
+    if not NO_ANYK and loose:
         out |= r - anyk
     return out
 
@@ -1052,6 +1053,11 @@ def attr_tests(ckey, names, why, keys=None):
             mode = keyed.get((c, a))
             if mode == "skip":
                 continue
+            if a == "NUMERIC_ESCAPES" and mode is True and keys is not None and NUMERIC_KEYS_SAME[0] and NUM_ESC_KEYED:
+                # value-only edit, same keys: the tokenizer reads a value only through .get(key) (recorded per
+                # key); everyone else only tests which keys exist or whether there are any, which is unchanged
+                out |= keyed_readers(c, a, keys, loose=False)
+                continue
             if a == "TRANSFORMS" and mode:
                 # TRANSFORMS feeds the per-class dispatch table, looked up per expression type
                 out |= keyed_readers(c, a, keys, star=False) | dispatch_readers(c, keys)
@@ -1087,6 +1093,7 @@ def attr_tests(ckey, names, why, keys=None):
 
 
 NUMERIC_KEYS_SAME = [False]
+NUM_ESC_KEYED = os.environ.get("BR_NUM_ESC_KEYED", "1") == "1"
 DATA_VALUE = [False]   # the changed class attribute holds plain data (tracked per read), not a callable
 DATA_RULE = os.environ.get("BR_DATA_RULE", "1") == "1"
 
@@ -1244,6 +1251,7 @@ def import_level_tests(path, items, why, new_tree=None):
                                      and is_data_value(st.value) and is_data_value(nst.value))
                     if nst is not None:
                         keys = changed_keys(st.value, nst.value)
+                        NUMERIC_KEYS_SAME[0] = False
                         if names[0] == "NUMERIC_ESCAPES" and keys is not None:
                             o = flatten_value(st.value)[1]
                             n = flatten_value(nst.value)[1]
