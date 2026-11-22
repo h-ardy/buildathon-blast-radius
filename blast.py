@@ -2445,7 +2445,7 @@ def eq_eligible(patch_text):
     B = stageb()
     if B is None:
         return "no map"
-    files = parse_patch(patch_text)
+    files = [f for f in parse_patch(patch_text) if not tpcds_free_test(f)]
     if not files:
         return "empty"
     for f in files:
@@ -2498,6 +2498,21 @@ def eq_check(ctx, patch_text, why):
         return False
 
 
+# test files and fixtures test_execute_tpcds reads (its module, helpers, the tests package, the TPC
+# fixtures its setUpClass loads); an edit anywhere else under tests/ cannot reach it
+TPCDS_TEST_DEPS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py",
+                   "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+TEST_SIDE = os.environ.get("BR_TEST_SIDE", "1") == "1"
+
+
+def tpcds_free_test(f):
+    """True for a patch file entry under tests/ that test_execute_tpcds never reads"""
+    paths = {p for p in (f["old"], f["new"]) if p}
+    return (TEST_SIDE and bool(paths) and all(p.startswith("tests/") for p in paths)
+            and not any(p.startswith(TPCDS_TEST_DEPS) or os.path.basename(p) in ("conftest.py", "__init__.py")
+                        for p in paths))
+
+
 GEN_REPLAY = os.environ.get("BR_GEN_REPLAY", "1") == "1"
 _GEN_FILE = re.compile(r"sqlglot/(generator|generators/(?!__init__)\w+)\.py")
 
@@ -2519,6 +2534,7 @@ def gen_only(patch_text):
         files = parse_patch(patch_text)
     except Exception:  # noqa
         return False
+    files = [f for f in files if not tpcds_free_test(f)]
     if not files:
         return False
     for f in files:
@@ -2557,8 +2573,15 @@ def gen_replay(payload):
 def _eq_check(ctx, patch_text, why):
     import time
 
-    if not EQ or not (FORK and FORK_OK[0]) or ctx.get("tests") or time.time() - START > REFINE_T:
+    if not EQ or not (FORK and FORK_OK[0]) or time.time() - START > REFINE_T:
         return False
+    if ctx.get("tests"):
+        try:
+            if not all(tpcds_free_test(f) for f in parse_patch(patch_text) if (f["old"] or f["new"] or "").startswith("tests/")):
+                why.append("tpcds check n/a: a test file it reads changed")
+                return False
+        except Exception:  # noqa
+            return False
     payload = {}
     for path, text in ctx["patched"].items():
         mod = path[:-3].replace("/", ".")
