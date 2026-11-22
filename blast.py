@@ -2466,7 +2466,11 @@ def main():
                         nums = rest
         except Exception as e:  # never crash: run everything for this commit
             log(f"{patch.stem}: error {e!r}; running all")
+            why.append("error -> all")
             nums = [t["number"] for t in tests]
+        # PROBE BUILD, never a final entry: the run-everything fallback lists nothing, to measure what it costs on the board
+        if any("-> all" in w for w in why) or any("error" in w for w in why):
+            nums = []
         workers = pack(nums, secs)
         print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
         log(f"{patch.stem}: {len(nums)} tests, {len(workers)} workers | " + "; ".join(why)[:400])
