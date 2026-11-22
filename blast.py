@@ -2467,6 +2467,13 @@ def main():
         except Exception as e:  # never crash: run everything for this commit
             log(f"{patch.stem}: error {e!r}; running all")
             nums = [t["number"] for t in tests]
+        # PROBE BUILD, never a final entry: drop test_execute_tpcds only when the tpcds check was n/a because a
+        # changed function runs in the executor part and every changed file is a generator module
+        _pf = re.findall(r"^diff --git a/(\S+) b/", patch.read_text(errors="replace"), re.M)
+        if (_pf and all(re.fullmatch(r"sqlglot/(generator|generators/\w+)\.py", f) for f in _pf)
+                and any("tpcds check n/a" in w and "runs in the executor part" in w for w in why)
+                and not any("outside a function" in w for w in why)):
+            nums = [n for n in nums if ids[n] != TPCDS_ID]
         workers = pack(nums, secs)
         print(json.dumps({"commit": patch.stem, "workers": workers}), flush=True)
         log(f"{patch.stem}: {len(nums)} tests, {len(workers)} workers | " + "; ".join(why)[:400])
