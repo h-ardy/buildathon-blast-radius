@@ -2339,6 +2339,92 @@ def _eq_check(ctx, patch_text, why):
     return True
 
 
+# ----------------------------------------------------------------------------- one-operator swaps
+# map/opmap.json.gz (tools/opmap_plug.py, pinned tree only): for every single comparison in sqlglot,
+# which tests evaluated it, and in which of those a sibling operator would have answered differently
+# on the very operands the test compared. A patch that only swaps that one operator leaves every other
+# test's run identical, step for step, so those tests cannot change outcome. The map holds compared
+# values' outcomes, never patches or failures: what the new operator does is decided here.
+OPMAP = os.environ.get("BR_OPMAP", "1") == "1"
+_OPM = {}
+
+
+def opmap():
+    if not _OPM:
+        try:
+            _OPM.update(json.load(gzip.open(HERE / "map" / "opmap.json.gz", "rt")))
+        except Exception as e:  # noqa
+            log(f"no operand map {e!r}")
+            _OPM["?"] = 1
+    return None if "?" in _OPM else _OPM
+
+
+def single_swap(old_text, new_text):
+    """-> (line, col, old op, new op) when the files differ only in one comparison's operator"""
+    try:
+        a, b = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    na, nb = list(ast.walk(a)), list(ast.walk(b))
+    if len(na) != len(nb):
+        return None
+    diffs = []
+    for x, y in zip(na, nb):
+        if isinstance(x, ast.cmpop) and isinstance(y, ast.cmpop):
+            continue
+        if type(x) is not type(y):
+            return None
+        if isinstance(x, ast.Compare) and [type(o) for o in x.ops] != [type(o) for o in y.ops]:
+            if len(x.ops) != 1 or len(y.ops) != 1:
+                return None
+            diffs.append((x, y))
+    if len(diffs) != 1:
+        return None
+    x, y = diffs[0]
+    saved = y.ops
+    y.ops = x.ops
+    same = ast.dump(a) == ast.dump(b)
+    y.ops = saved
+    return (x.lineno, x.col_offset, type(x.ops[0]).__name__, type(y.ops[0]).__name__) if same else None
+
+
+def op_narrow(nums, ctx, patch_text, why):
+    if not OPMAP or ctx.get("tests"):
+        return nums
+    try:
+        files = parse_patch(patch_text)
+        if len(files) != 1:
+            return nums
+        f = files[0]
+        p = f["old"]
+        if f["status"] != "modified" or f["binary"] or p != f["new"] or p not in ctx.get("patched", {}):
+            return nums
+        sw = single_swap(SRC[p], ctx["patched"][p])
+        if not sw:
+            return nums
+        M = opmap()
+        if M is None:
+            return nums
+        line, col, old, new = sw
+        site = M["sites"].get(f"{p}:{line}:{col}")
+        if site is None or site[0] != old or new not in site[1]:
+            why.append(f"{p}:{line} {old}->{new}: no operand record")
+            return nums
+        sid = str(site[2])
+        if f"{sid}:{new}" in M["shared_dis"]:
+            why.append(f"{p}:{line} {old}->{new}: answers differently while modules load")
+            return nums
+        hit = set(M["hit"].get(sid, ()))
+        dis = set(M["dis"].get(f"{sid}:{new}", ()))
+        keep = [n for n in nums if n not in hit or n in dis]
+        why.append(f"{p}:{line} {old}->{new}: same answer on every recorded operand for "
+                   f"{len(nums) - len(keep)} tests -> {len(keep)}")
+        return keep
+    except Exception as e:  # noqa  the map only ever removes tests; on doubt keep them
+        why.append(f"operand check error {e!r}")
+        return nums
+
+
 def main():
     tests_json = json.loads((DATA / "tests.json").read_text())
     tests = tests_json["tests"]
@@ -2370,6 +2456,7 @@ def main():
             if nums or any("-> all" in w for w in why):
                 nums = sorted(set(nums) | set(unknown))
             if not unknown and not any("-> all" in w for w in why):
+                nums = op_narrow(nums, ctx, patch.read_text(errors="replace"), why)
                 nums = refine(nums, secs, ids, ctx, why)
                 # still keeping test_execute_tpcds (no cheap run, or a cheap test failed)
                 tn = [n for n in nums if ids[n] == TPCDS_ID]
